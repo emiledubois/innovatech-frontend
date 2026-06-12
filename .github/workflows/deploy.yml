@@ -1,0 +1,56 @@
+name: CI/CD – Frontend Innovatech
+
+on:
+  push:
+    branches: [deploy]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/innovatech-frontend
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login a Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build y Push imagen
+        run: |
+          docker build \
+            --build-arg VITE_BACKEND_DESPACHOS_URL=http://${{ secrets.EC2_BACKEND_HOST }}:8081 \
+            --build-arg VITE_BACKEND_VENTAS_URL=http://${{ secrets.EC2_BACKEND_HOST }}:8080 \
+            -t $ECR_REPO:${{ github.sha }} \
+            -t $ECR_REPO:latest .
+          docker push $ECR_REPO:${{ github.sha }}
+          docker push $ECR_REPO:latest
+
+      - name: Deploy en EC2 Frontend
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.EC2_FRONTEND_HOST }}
+          username: ec2-user
+          key:      ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            aws ecr get-login-password --region us-east-1 | \
+              docker login --username AWS --password-stdin \
+              ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+            docker pull ${{ env.ECR_REPO }}:latest
+            docker stop frontend || true
+            docker rm   frontend || true
+            docker run -d \
+              --name frontend \
+              --restart unless-stopped \
+              -p 80:80 \
+              ${{ env.ECR_REPO }}:latest
