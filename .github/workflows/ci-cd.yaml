@@ -15,8 +15,6 @@ jobs:
   build-and-push-ecr:
     name: Build & Push ECR
     runs-on: ubuntu-latest
-    outputs:
-      image: ${{ steps.build-image.outputs.image }}
     steps:
       - name: Checkout codigo
         uses: actions/checkout@v4
@@ -45,7 +43,6 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build tag y push imagen
-        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
@@ -54,7 +51,6 @@ jobs:
           docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
   deploy-ecs:
     name: Deploy a ECS
@@ -69,24 +65,36 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Obtener Task Definition actual
+      - name: Login en Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Obtener Task Definition y actualizar imagen
+        id: task-def
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           aws ecs describe-task-definition \
             --task-definition innovatech-frontend \
             --query taskDefinition > /tmp/task-def.json
-
-      - name: Actualizar imagen en Task Definition
-        id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: /tmp/task-def.json
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ needs.build-and-push-ecr.outputs.image }}
+          # Reemplazar la imagen directamente en el JSON
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          jq --arg IMAGE "$IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE' \
+            /tmp/task-def.json > /tmp/task-def-new.json
+          # Registrar nueva revision
+          aws ecs register-task-definition \
+            --cli-input-json file:///tmp/task-def-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text > /tmp/new-task-def-arn.txt
+          echo "task_def_arn=$(cat /tmp/new-task-def-arn.txt)" >> $GITHUB_OUTPUT
 
       - name: Deployar en ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-        with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition $(cat /tmp/new-task-def-arn.txt) \
+            --region $AWS_REGION
+          echo "Despliegue iniciado"
